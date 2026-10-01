@@ -33,6 +33,13 @@
 含这些批次的**已确认核验单转待复核**，历次确认快照保持原样。未知批次或目标线、
 已作废批次、目标线与原线相同均整体拒绝，失败不留下部分归属或裁决版本。
 
+正式更正某批**开工前清洁记录**前，可先做**只读预演**：输入有效批次号与拟更正的完整
+清洁过敏原代码集合，服务以**同一次当前数据快照**从该批起**跳过作废批次**逐批推演
+残留、实际过敏原、未声明项及 RELEASE/HOLD，返回**每批当前与预演结论、变化原因**，
+以及若正式更正将因裁决版本追加而**转待复核的已确认核验单及关联批次**；即使结论相同，
+后续有效批次仍属于**版本影响范围**。预演**不更改**清洁记录、裁决/出货资格版本、
+核验单状态或历史；未知或已作废批次、非法过敏原代码整体报错。
+
 - 技术栈：Python 3.11 + FastAPI + SQLite（标准库 `sqlite3`，WAL 模式）
 - 数据落盘：单个 SQLite 文件，Docker 卷持久化
 - 一键启动：`docker compose up`（首次启动自动建表、写入过敏原字典与演示原料批号）
@@ -136,6 +143,60 @@
 | 目标线与原产线相同 | 409 | `SAME_SOURCE_TARGET_LINE` |
 | `target_line_id` 为空/纯空白或缺字段 | 400/422 | `INVALID_PAYLOAD` / FastAPI 校验 |
 
+### 清洁更正预演（只读推演）
+
+生产主管在正式更正某批开工前清洁记录前，可预演对同线后续放行及已确认出货核验单的影响
+（`POST /api/batches/{batch_no}/cleaning/preview`，请求体与清洁更正相同：
+`{"cleaned_allergens": ["peanut"]}`，为**全量替换**的完整代码集合）：
+
+- **同一次当前数据快照**：整个预演在单次只读快照内完成，与正式更正同一推演口径——
+  从该批起**跳过作废批次**按产线顺序逐批推演带入残留、实际过敏原、未声明项及
+  RELEASE/HOLD；目标批使用拟更正的清洁集合，其后有效批次沿用各自登记值。
+- **逐批当前与预演结论、变化原因**：`simulations[]` 逐批给出当前裁决（版本/实际/
+  未声明/结论）与预演结论（带入/残留/实际/未声明/结论）、是否变化及变化原因
+  （`CLEANING_CORRECTION` / `UPSTREAM_RECOMPUTE` / `ACTUAL_ALLERGENS_CHANGED` /
+  `UNDECLARED_ALLERGENS_CHANGED` / `DISPOSITION_CHANGED` / `CONCLUSION_UNCHANGED`）。
+- **版本影响范围**：即使结论相同，目标批及其后全部有效批次仍属于版本影响范围
+  （`impacted_batch_nos`）——正式更正会为这些批次逐一追加裁决版本。
+- **已确认核验单影响**：`affected_verifications[]` 列出若正式更正将因裁决版本追加而
+  **转待复核**的已确认核验单（`would_be_status=PENDING_REVIEW`）及其关联批次
+  （`batch_nos` 全量、`impacted_batch_nos` 处于版本影响范围内的部分）；
+  草稿/待复核单据不转态、不列出。
+- **待检锁定不参与推演**：原料批号待检锁定仅影响出货资格，不参与过敏原推演；
+  预演不读取也不更改出货资格版本。
+- **只读**：预演不更改清洁记录、裁决/出货资格版本、核验单状态或任何历史，
+  可反复调用；`read_only=true`。
+- **整体报错**：未知批次 404 `CORRECTION_TARGET_NOT_FOUND`、已作废批次 409
+  `BATCH_VOIDED`、非法过敏原代码 400 `INVALID_ALLERGEN`（与正式更正入口一致）。
+
+预演响应示例（节选）：
+
+```jsonc
+{
+  "batch_no": "B002", "line_id": "L1", "seq": 2,
+  "current_cleaned_allergens": ["peanut"],
+  "proposed_cleaned_allergens": [],
+  "read_only": true,
+  "impacted_batch_nos": ["B002", "B003"],
+  "simulations": [
+    {
+      "batch_no": "B002", "line_id": "L1", "seq": 2,
+      "current":  { "version": 1, "actual_allergens": [], "undeclared_allergens": [], "disposition": "RELEASE" },
+      "simulated": { "carried_in": ["peanut"], "residual": ["peanut"],
+                     "actual_allergens": ["peanut"], "undeclared_allergens": ["peanut"],
+                     "disposition": "HOLD" },
+      "changed": true, "disposition_changed": true,
+      "change_reasons": [ { "code": "CLEANING_CORRECTION", "message": "拟将本批……" } ]
+    }
+  ],
+  "affected_verifications": [
+    { "verification_no": "SH-001", "status": "CONFIRMED",
+      "would_be_status": "PENDING_REVIEW",
+      "batch_nos": ["B002", "B003"], "impacted_batch_nos": ["B002", "B003"] }
+  ]
+}
+```
+
 拒绝规则（失败时整个请求回滚，**不留下部分改动**）：
 
 | 场景 | HTTP | error.code |
@@ -193,7 +254,7 @@ python -m app
 
 ```bash
 pip install pytest httpx
-python -m pytest -q            # 102 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、旧库升级
+python -m pytest -q            # 115 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、清洁更正预演、旧库升级
 
 # 服务启动后，运行端到端调用示例（标准库 urllib，无需额外依赖）
 python examples/run_demo.py
@@ -214,6 +275,10 @@ BASE_URL=http://127.0.0.1:8080 python examples/batch_void_demo.py
 # 误归产线更正（换线）端到端示例（两线重算/原线留空/历史产线序号不改/资格版本不递增/核验单联动）
 python examples/batch_reassign_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/batch_reassign_demo.py
+
+# 清洁更正预演端到端示例（只读推演/变化原因/版本影响范围/已确认核验单联动/拒绝场景/与正式更正一致）
+python examples/cleaning_preview_demo.py
+BASE_URL=http://127.0.0.1:8080 python examples/cleaning_preview_demo.py
 ```
 
 ---
@@ -287,6 +352,7 @@ BASE_URL=http://127.0.0.1:8080 python examples/batch_reassign_demo.py
 | GET | `/api/batches/{batch_no}` | 查询批次及当前裁决快照 |
 | PUT | `/api/batches/{batch_no}` | **更正批次**（用料/声明/清洁，任一可选），重算本批及后续批次 |
 | PUT | `/api/batches/{batch_no}/cleaning` | 专用：仅更正开工前清洁核验确认清除的过敏原 |
+| POST | `/api/batches/{batch_no}/cleaning/preview` | **预演清洁更正（只读）**：同一次快照逐批推演同线后续批次与已确认核验单影响，不写库 |
 | POST | `/api/batches/{batch_no}/void` | **作废误登记批次**，请求体 `{"reason": "..."}`（必填非空）；保留可查、号不可复用，其后有效批次按序重算，已确认核验单转待复核；重复作废幂等 |
 | POST | `/api/batches/{batch_no}/reassign` | **更正误归产线（换线）**，请求体 `{"target_line_id": "L2"}`（须为另一条已登记产线）；批次移至目标线末尾获新顺序号，原线序号留空，两线按序重算追加 `MOVE_BATCH` 版本，已确认核验单转待复核；直接用料不变、出货资格版本不递增 |
 | GET | `/api/batches/{batch_no}/history` | 查询该批**历史裁决版本**（只追加，含触发原因与时间；逐版记录当时产线与顺序号），作废批次标明状态 |
@@ -608,6 +674,13 @@ curl -s -X POST http://127.0.0.1:8080/api/batches/B003/reassign \
 
 # 21) 查询历史裁决版本：v1 保留原产线/顺序号，v2 为换线后（MOVE_BATCH）
 curl -s http://127.0.0.1:8080/api/batches/B003/history
+
+# 22) 清洁更正预演（只读）：正式更正前推演同线后续批次与已确认核验单影响
+#     逐批返回当前与预演结论、变化原因、版本影响范围及将转待复核的已确认核验单；
+#     不更改清洁记录、裁决/资格版本、核验单状态或历史
+curl -s -X POST http://127.0.0.1:8080/api/batches/B003/cleaning/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"cleaned_allergens":["peanut"]}'
 ```
 
 更多可运行示例见 [`examples/run_demo.py`](examples/run_demo.py)（包含完整的
@@ -622,7 +695,10 @@ curl -s http://127.0.0.1:8080/api/batches/B003/history
 误归产线更正（换线）全流程示例见 [`examples/batch_reassign_demo.py`](examples/batch_reassign_demo.py)
 （拒绝场景 → 换线新旧归属/原线留空 → 两线重算与历史版本产线序号不改 →
 出货资格版本不递增 → 已确认单据转待复核且确认快照原样 → 顺序号不复用 →
-重新核验后二次确认与历史快照保留）。
+重新核验后二次确认与历史快照保留）；
+清洁更正预演全流程示例见 [`examples/cleaning_preview_demo.py`](examples/cleaning_preview_demo.py)
+（只读推演同线后续批次 → 逐批当前/预演结论与变化原因 → 版本影响范围 →
+已确认核验单将转待复核 → 预演不改任何记录 → 拒绝场景 → 正式更正与预演一致）。
 示例脚本可重复调用其中的“登记原料批号”接口（重复时自动跳过）；批次号固定，
 重复运行前如需重置可 `docker compose down -v` 后重新启动，或删除本地 `data/` 目录。
 
@@ -646,11 +722,13 @@ curl -s http://127.0.0.1:8080/api/batches/B003/history
 ├── examples/lot_lock_demo.py     # 原料批号待检锁定/出货资格端到端调用示例
 ├── examples/batch_void_demo.py   # 误登记批次作废端到端调用示例
 ├── examples/batch_reassign_demo.py # 误归产线更正（换线）端到端调用示例
+├── examples/cleaning_preview_demo.py # 清洁更正预演（只读推演）端到端调用示例
 ├── tests/test_service.py         # pytest 测试（裁决/更正/历史，20 项）
 ├── tests/test_verification.py    # pytest 测试（出货核验单，15 项）
 ├── tests/test_lot_lock.py        # pytest 测试（批号锁定/出货资格/旧库升级，18 项）
 ├── tests/test_batch_void.py      # pytest 测试（批次作废/重算联动/核验单拒绝/旧库升级，23 项）
 ├── tests/test_batch_reassign.py  # pytest 测试（误归产线换线/两线重算/历史归属/资格不递增/核验单联动/原子性，26 项）
+├── tests/test_cleaning_preview.py # pytest 测试（清洁更正预演/只读/版本影响范围/核验单联动/拒绝，13 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
