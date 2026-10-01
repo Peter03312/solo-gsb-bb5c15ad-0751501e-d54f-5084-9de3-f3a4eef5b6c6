@@ -62,6 +62,36 @@
   裁决版本**，可随时查询。
 - 更正接口为**全量替换**语义（传入的数组代表更正后的完整集合，不传的字段保持不变）。
 
+### 开工前清洁更正预演（只读）
+
+生产主管在**正式更正某批开工前清洁记录前**，可先用同一次当前数据快照预演对同线后续
+放行与已确认出货核验单的影响（`POST /api/batches/{batch_no}/cleaning/preview`，请求体
+`{"cleaned_allergens": [...]}`，与正式清洁更正入口相同的全量集合与校验）：
+
+- **逐批推演**：从拟更正批（含）起，按同线有效批次顺序逐批复算
+  带入/残留/本批/实际/未声明与 RELEASE/HOLD；已作废批次不参与推演、自动跳过
+  （作废批退出残留链，其清洁视为未发生）并在 `skipped_voided_batches` 中列出。
+- **当前与预演并列返回**：每批给出 `current`（当前版本与裁决，含带入/残留/本批来源）
+  与 `preview`（拟更正落库后的裁决，预演版本号 = 当前版本 + 1，trigger=`CORRECT_BATCH`），
+  以及 `changed` 与逐条 `change_reasons`（清洁集合变化、残留/实际/未声明项变化、
+  RELEASE↔HOLD 翻转）。
+- **结论相同仍属版本影响范围**：从拟更正批起的每个**后续有效批次**都在范围内
+  （`in_version_scope=true`）——即使预演裁决与当前完全一致，正式更正仍会为其追加一个
+  裁决版本；`change_reasons` 给出 `NO_ADJUDICATION_CONTENT_CHANGE` 说明。更正点之前的
+  批次不在范围内、不返回。
+- **已确认核验单影响**：`affected_verifications` 仅列出**当前 CONFIRMED** 且含范围内
+  批次的核验单——它们将在正式更正后因裁决版本追加而自动转**待复核**（即使结论仍为
+  RELEASE）；逐批给出当前/预演裁决版本与结论。草稿/待复核单据不列入（本就待重新核验）。
+- **待检锁定不参与过敏原推演**：预演只推演过敏原链路；清洁更正不改变直接用料，
+  `shipment_eligibility.would_advance_if_applied` 恒为 `false`，并回显当前出货资格现状
+  （锁定只影响出货资格）。
+- **严格只读**：预演在一次读取快照内离线计算，**不更改**清洁记录、裁决/出货资格版本、
+  核验单状态或任何历史；可重复调用，预演版本预测不随调用次数漂移。
+- **整体报错**：未知批次 404 `CORRECTION_TARGET_NOT_FOUND`、已作废批次 409 `BATCH_VOIDED`、
+  过敏原代码非法 400 `INVALID_ALLERGEN`（与正式更正入口一致，全部失败不留任何改动）。
+- 预演结果与随后调用 `PUT /api/batches/{batch_no}/cleaning` 正式落库的重算结果逐批一致；
+  原有更正与核验行为保持不变。
+
 ### 原料批号待检锁定与出货资格
 
 原料批号可因待检风险按批号锁定、复检后解除（均须填写原因）：
@@ -193,11 +223,15 @@ python -m app
 
 ```bash
 pip install pytest httpx
-python -m pytest -q            # 102 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、旧库升级
+python -m pytest -q            # 122 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、清洁更正预演（只读）、旧库升级
 
 # 服务启动后，运行端到端调用示例（标准库 urllib，无需额外依赖）
 python examples/run_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/run_demo.py   # 显式指定地址
+
+# 开工前清洁更正预演端到端示例（逐批当前/预演结论与变化原因、已确认核验单转待复核、只读性核对、拒绝场景、与正式更正一致）
+python examples/cleaning_preview_demo.py
+BASE_URL=http://127.0.0.1:8080 python examples/cleaning_preview_demo.py
 
 # 出货核验单端到端示例（创建/拒绝/HOLD 拦截/确认/更正转待复核/重新核验/二次确认）
 python examples/verification_demo.py
@@ -287,6 +321,7 @@ BASE_URL=http://127.0.0.1:8080 python examples/batch_reassign_demo.py
 | GET | `/api/batches/{batch_no}` | 查询批次及当前裁决快照 |
 | PUT | `/api/batches/{batch_no}` | **更正批次**（用料/声明/清洁，任一可选），重算本批及后续批次 |
 | PUT | `/api/batches/{batch_no}/cleaning` | 专用：仅更正开工前清洁核验确认清除的过敏原 |
+| POST | `/api/batches/{batch_no}/cleaning/preview` | **只读预演**：正式清洁更正前推演同线该批及后续有效批次残留/实际/未声明/RELEASE/HOLD，及将转待复核的已确认核验单（不改任何数据） |
 | POST | `/api/batches/{batch_no}/void` | **作废误登记批次**，请求体 `{"reason": "..."}`（必填非空）；保留可查、号不可复用，其后有效批次按序重算，已确认核验单转待复核；重复作废幂等 |
 | POST | `/api/batches/{batch_no}/reassign` | **更正误归产线（换线）**，请求体 `{"target_line_id": "L2"}`（须为另一条已登记产线）；批次移至目标线末尾获新顺序号，原线序号留空，两线按序重算追加 `MOVE_BATCH` 版本，已确认核验单转待复核；直接用料不变、出货资格版本不递增 |
 | GET | `/api/batches/{batch_no}/history` | 查询该批**历史裁决版本**（只追加，含触发原因与时间；逐版记录当时产线与顺序号），作废批次标明状态 |
@@ -415,6 +450,114 @@ BASE_URL=http://127.0.0.1:8080 python examples/batch_reassign_demo.py
 更正若重算了核验单所含批次，响应还附带 `affected_verifications`（含各核验单更正后的状态）。
 批次更正响应另含 `shipment_eligibility`（本次是否递增资格版本、版本号、状态、锁定批号）。
 
+### 开工前清洁更正预演（只读）
+
+`POST /api/batches/{batch_no}/cleaning/preview`，请求体与正式清洁更正完全一致：
+
+```json
+{ "cleaned_allergens": ["peanut"] }
+```
+
+响应（`200`）：
+
+```jsonc
+{
+  "simulation": "CLEANING_CORRECTION_PREVIEW",
+  "read_only": true,
+  "correction_target": {
+    "batch_no": "B2026002", "line_id": "L1", "seq": 2,
+    "current_cleaned_allergens": [],            // 当前清洁记录
+    "proposed_cleaned_allergens": ["peanut"]    // 拟更正的完整集合
+  },
+  "line_id": "L1",
+  "start_seq": 2,
+  "batches": [                                  // 从拟更正批（含）起的有效批次，按 seq
+    {
+      "batch_no": "B2026002", "line_id": "L1", "seq": 2,
+      "status": "ACTIVE", "voided": false,
+      "is_correction_target": true,
+      "proposed_cleaned_allergens": ["peanut"],
+      "current": {                              // 当前裁决（快照现状）
+        "version": 3,
+        "cleaned_allergens": [],
+        "carried_in_allergens": ["peanut"],     // 上一有效批实际过敏原（带入）
+        "residual_allergens": ["peanut"],       // 带入 − 本次清洁确认清除
+        "from_material_allergens": [],
+        "actual_allergens": ["peanut"],
+        "undeclared_allergens": ["peanut"],
+        "disposition": "HOLD",
+        "reasons": [ /* ... */ ], "sources": { /* ... */ }
+      },
+      "preview": {                              // 拟更正落库后的预演裁决
+        "version": 4,                           // = 当前版本 + 1（正式更正将追加 CORRECT_BATCH）
+        "trigger_if_applied": "CORRECT_BATCH",
+        "cleaned_allergens": ["peanut"],
+        "carried_in_allergens": ["peanut"],
+        "residual_allergens": [],
+        "from_material_allergens": [],
+        "actual_allergens": [],
+        "undeclared_allergens": [],
+        "disposition": "RELEASE",
+        "reasons": [ /* ... */ ], "sources": { /* ... */ }
+      },
+      "changed": true,                          // 残留/实际/未声明/结论是否有任一变化
+      "change_reasons": [                       // 逐条变化原因；无变化时给出仅追加版本说明
+        { "code": "CLEANING_SET_CHANGED", "from": [], "to": ["peanut"],
+          "added": ["peanut"], "removed": [], "message": "..." },
+        { "code": "RESIDUAL_CHANGED", "from": ["peanut"], "to": [], "message": "..." },
+        { "code": "ACTUAL_ALLERGENS_CHANGED", "/* ... */": "..." },
+        { "code": "UNDECLARED_ALLERGENS_CHANGED", "/* ... */": "..." },
+        { "code": "DISPOSITION_CHANGED", "from": "HOLD", "to": "RELEASE", "message": "..." }
+      ],
+      "in_version_scope": true,                 // 结论相同也为 true：正式更正必追加版本
+      "shipment_eligibility": {                 // 待检锁定不参与过敏原推演
+        "version": 2,
+        "would_advance_if_applied": false,      // 清洁更正不改直接用料，资格版本不递增
+        "current": { /* 当前出货资格现状：status/locked_lots/reasons */ }
+      }
+    }
+    // …后续有效批次同样逐批给出（即使预演结论与当前相同）
+  ],
+  "skipped_voided_batches": [                   // 从该批起同线已作废批次（逐批推演时跳过）
+    { "batch_no": "B2026005", "line_id": "L1", "seq": 5, "status": "VOIDED",
+      "voided_reason": "计划误登记，实际未投产", "voided_at": "...",
+      "reason": "已作废批次不参与同线残留传递，预演逐批推演时自动跳过" }
+  ],
+  "affected_verifications": [                   // 仅当前 CONFIRMED 的单据；正式更正后将转待复核
+    {
+      "verification_no": "SH-001",
+      "current_status": "CONFIRMED",
+      "status_if_applied": "PENDING_REVIEW",
+      "updated_at": "...",
+      "reason": "所含批次将因清洁更正正式落库而追加裁决版本（CORRECT_BATCH），即使裁决结论不变，已确认核验单也将自动转待复核，重新核验后才能再次确认",
+      "batches": [                              // 按单据内顺序，仅列处于版本影响范围的批次
+        { "position": 1, "batch_no": "B2026003", "line_id": "L1", "seq": 3,
+          "current_version": 2, "current_disposition": "RELEASE",
+          "preview_version": 3, "preview_disposition": "RELEASE",
+          "preview_undeclared_allergens": [],
+          "disposition_changed": false }
+      ]
+    }
+  ]
+}
+```
+
+变化原因 `change_reasons[].code`：
+
+| code | 含义 |
+| --- | --- |
+| `CLEANING_SET_CHANGED` | 仅目标批：清洁确认清除集合将全量替换（含 `added` / `removed`） |
+| `RESIDUAL_CHANGED` | 清洁后产线残留过敏原集合变化 |
+| `ACTUAL_ALLERGENS_CHANGED` | 实际可能含有的过敏原变化 |
+| `UNDECLARED_ALLERGENS_CHANGED` | 未声明过敏原变化 |
+| `DISPOSITION_CHANGED` | RELEASE ↔ HOLD 翻转 |
+| `NO_ADJUDICATION_CONTENT_CHANGE` | 裁决内容无变化，但正式更正仍追加版本、仍属版本影响范围 |
+
+要点：预演**严格只读**（清洁记录、裁决/资格版本、核验单状态、历史均不变）；
+从拟更正批起跳过作废批次逐批推演；后续有效批次即使结论相同仍在版本影响范围内；
+待检锁定只影响出货资格、不参与过敏原推演；预演结果与随后正式 `PUT .../cleaning`
+落库的重算结果一致；未知/已作废批次、非法过敏原代码整体报错（错误码与正式更正一致）。
+
 ### 出货核验单
 
 | 方法 | 路径 | 说明 |
@@ -539,6 +682,12 @@ curl -s -X PUT http://127.0.0.1:8080/api/batches/B003/cleaning \
   -H 'Content-Type: application/json' \
   -d '{"cleaned_allergens":["peanut"]}'
 
+# 5b) 正式更正前先“只读预演”：推演同线该批及后续有效批次的残留/实际/未声明/RELEASE|HOLD，
+#     并列出将因裁决版本追加而转待复核的已确认核验单（不改动任何数据）
+curl -s -X POST http://127.0.0.1:8080/api/batches/B003/cleaning/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"cleaned_allergens":["peanut"]}'
+
 # 6) 更正原料批号过敏原（例如复检发现还含 sesame）—— 所有引用批次按线重算
 curl -s -X PUT http://127.0.0.1:8080/api/material-lots/RM-NUT-001 \
   -H 'Content-Type: application/json' \
@@ -622,7 +771,11 @@ curl -s http://127.0.0.1:8080/api/batches/B003/history
 误归产线更正（换线）全流程示例见 [`examples/batch_reassign_demo.py`](examples/batch_reassign_demo.py)
 （拒绝场景 → 换线新旧归属/原线留空 → 两线重算与历史版本产线序号不改 →
 出货资格版本不递增 → 已确认单据转待复核且确认快照原样 → 顺序号不复用 →
-重新核验后二次确认与历史快照保留）。
+重新核验后二次确认与历史快照保留）；
+开工前清洁更正预演示例见 [`examples/cleaning_preview_demo.py`](examples/cleaning_preview_demo.py)
+（已确认单据与整链 RELEASE 基线 → 预演改为不清洁逐批 HOLD 及变化原因 →
+结论相同仍属版本影响范围 → 只读性核对 → 未知批次/非法过敏原拒绝 →
+正式更正落库与预演一致并使单据转待复核）。
 示例脚本可重复调用其中的“登记原料批号”接口（重复时自动跳过）；批次号固定，
 重复运行前如需重置可 `docker compose down -v` 后重新启动，或删除本地 `data/` 目录。
 
@@ -646,11 +799,13 @@ curl -s http://127.0.0.1:8080/api/batches/B003/history
 ├── examples/lot_lock_demo.py     # 原料批号待检锁定/出货资格端到端调用示例
 ├── examples/batch_void_demo.py   # 误登记批次作废端到端调用示例
 ├── examples/batch_reassign_demo.py # 误归产线更正（换线）端到端调用示例
+├── examples/cleaning_preview_demo.py # 开工前清洁更正预演（只读）端到端调用示例
 ├── tests/test_service.py         # pytest 测试（裁决/更正/历史，20 项）
 ├── tests/test_verification.py    # pytest 测试（出货核验单，15 项）
 ├── tests/test_lot_lock.py        # pytest 测试（批号锁定/出货资格/旧库升级，18 项）
 ├── tests/test_batch_void.py      # pytest 测试（批次作废/重算联动/核验单拒绝/旧库升级，23 项）
 ├── tests/test_batch_reassign.py  # pytest 测试（误归产线换线/两线重算/历史归属/资格不递增/核验单联动/原子性，26 项）
+├── tests/test_cleaning_preview.py # pytest 测试（清洁更正预演：逐批推演/版本影响范围/跳过作废批/锁定不参与/只读性/与正式更正一致/拒绝，20 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

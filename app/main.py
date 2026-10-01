@@ -140,6 +140,19 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
         """专用：更正“批次开始前清洁核验确认清除的过敏原”。"""
         return service.correct_cleaning(batch_no, body.cleaned_allergens)
 
+    @app.post("/api/batches/{batch_no}/cleaning/preview", tags=["清洁更正预演"])
+    def preview_cleaning_correction(batch_no: str, body: CleaningCorrection, service: Service = Depends(svc)):
+        """只读预演：正式更正开工前清洁记录前，推演同线该批及后续有效批次的
+        残留/实际过敏原/未声明项与 RELEASE/HOLD 变化，并列出将因裁决版本追加
+        而转待复核的已确认出货核验单。
+
+        预演以同一次当前数据快照计算，不更改清洁记录、裁决/资格版本、核验单状态或历史；
+        从该批起跳过作废批次逐批推演，后续有效批次即使结论相同仍属于版本影响范围；
+        待检锁定仅影响出货资格，不参与过敏原推演。
+        未知/已作废批次、非法过敏原代码整体报错（错误码与正式更正入口一致）。
+        """
+        return service.preview_cleaning_correction(batch_no, body.cleaned_allergens)
+
     @app.post("/api/batches/{batch_no}/void", tags=["批次作废"])
     def void_batch(batch_no: str, body: BatchVoidIn, service: Service = Depends(svc)):
         """作废误登记、实际未投产的批次（必须填写非空原因）。

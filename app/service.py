@@ -168,6 +168,117 @@ def _previous_actual(conn, line_id: str, start_seq: int) -> list[str]:
     return loads(row["actual"]) if row else []
 
 
+# ---------------------------------------------------------------- 清洁更正预演（只读）
+
+
+def _allergen_text(codes: list[str]) -> str:
+    if not codes:
+        return "（空）"
+    return "、".join(f"{al.ALLERGENS.get(code, code)}({code})" for code in codes)
+
+
+def _simulate_line(
+    batches: list[dict[str, Any]],
+    *,
+    override_batch_no: str | None = None,
+    override_cleaned: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """按有效批次顺序离线推演整条产线的过敏原残留与裁决（不落库）。
+
+    override_* 用于把指定批次的开工前清洁集合替换为“拟更正集合”；
+    其余批次记录一律取当前快照。已作废批次不在 batches 中（加载时即过滤）。
+    """
+    previous_actual: list[str] = []
+    results: dict[str, dict[str, Any]] = {}
+    for b in batches:
+        effective = b
+        if override_batch_no is not None and b["batch_no"] == override_batch_no:
+            effective = {**b, "cleaned": override_cleaned}
+        result = _adjudicate_batch(effective, previous_actual)
+        results[b["batch_no"]] = result
+        previous_actual = result["actual"]
+    return results
+
+
+def _preview_change_reasons(
+    *,
+    is_target: bool,
+    current_cleaned: list[str],
+    proposed_cleaned: list[str],
+    cur: dict[str, Any],
+    prev: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """对比某批“当前裁决”与“预演裁决”，逐条给出变化原因。
+
+    即使两者完全一致，也给出一条“仅追加版本、裁决内容不变”的说明——
+    正式更正时该批仍属于版本影响范围（已确认核验单仍会转待复核）。
+    """
+    reasons: list[dict[str, Any]] = []
+    if is_target and current_cleaned != proposed_cleaned:
+        added = [a for a in proposed_cleaned if a not in current_cleaned]
+        removed = [a for a in current_cleaned if a not in proposed_cleaned]
+        reasons.append(
+            {
+                "code": "CLEANING_SET_CHANGED",
+                "message": (
+                    "开工前清洁核验确认清除的过敏原拟由 "
+                    f"{_allergen_text(current_cleaned)} 全量更正为 "
+                    f"{_allergen_text(proposed_cleaned)}。"
+                ),
+                "from": current_cleaned,
+                "to": proposed_cleaned,
+                "added": added,
+                "removed": removed,
+            }
+        )
+
+    field_specs = (
+        ("residual", "RESIDUAL_CHANGED", "清洁后产线残留过敏原"),
+        ("actual", "ACTUAL_ALLERGENS_CHANGED", "实际可能含有的过敏原"),
+        ("undeclared", "UNDECLARED_ALLERGENS_CHANGED", "未声明过敏原"),
+    )
+    for field, code, label in field_specs:
+        if cur[field] != prev[field]:
+            reasons.append(
+                {
+                    "code": code,
+                    "message": (
+                        f"{label}由 {_allergen_text(cur[field])} "
+                        f"变为 {_allergen_text(prev[field])}。"
+                    ),
+                    "from": cur[field],
+                    "to": prev[field],
+                }
+            )
+
+    if cur["disposition"] != prev["disposition"]:
+        if prev["disposition"] == "HOLD":
+            message = f"裁决结论由 {cur['disposition']} 变为 HOLD（出现未声明过敏原，将扣留）。"
+        else:
+            message = f"裁决结论由 {cur['disposition']} 变为 RELEASE（未声明项清零，将放行）。"
+        reasons.append(
+            {
+                "code": "DISPOSITION_CHANGED",
+                "message": message,
+                "from": cur["disposition"],
+                "to": prev["disposition"],
+            }
+        )
+
+    if not reasons:
+        reasons.append(
+            {
+                "code": "NO_ADJUDICATION_CONTENT_CHANGE",
+                "message": (
+                    "预演裁决内容（残留/实际过敏原/未声明项/结论）与当前一致；"
+                    "正式更正仍会为本批追加一个裁决版本（CORRECT_BATCH），"
+                    "本批仍属于版本影响范围，引用本批的已确认核验单仍将转待复核。"
+                ),
+            }
+        )
+    return reasons
+
+
 def recompute_from(
     conn, line_id: str, start_seq: int, trigger: str
 ) -> list[dict[str, Any]]:
@@ -936,6 +1047,170 @@ class Service:
         """专用入口：仅更正“批次开始前清洁核验确认清除的过敏原”。"""
         return self.correct_batch(batch_no, None, None, cleaned_allergens)
 
+    def preview_cleaning_correction(
+        self, batch_no: str, cleaned_allergens: list[str]
+    ) -> dict[str, Any]:
+        """预演（只读）：若正式把某批开工前清洁核验“确认清除集合”全量更正为
+        cleaned_allergens，对同线该批及之后各有效批次的残留/实际过敏原/未声明项/
+        RELEASE|HOLD 有何影响，以及哪些“已确认”核验单会因裁决版本追加而转待复核。
+
+        - 以同一次当前数据快照离线推演：不更改清洁记录、裁决/资格版本、核验单状态或历史；
+        - 已作废批次整体报错（正式更正入口同样拒绝），不作废、不参与残留推演；
+        - 预演中遇到同线已作废批次自动跳过（它们本就退出残留链），并在响应中列出；
+        - 从该批（含）起的每个有效批次都属于“版本影响范围”——即使结论与当前相同，
+          正式更正仍会为其追加一个裁决版本；
+        - 待检锁定只影响出货资格，不参与过敏原推演（清洁更正也不改变直接用料，
+          出货资格版本不会因本次更正递增）。
+        """
+        batch_no = (batch_no or "").strip()
+        proposed = _normalize_allergen_list(cleaned_allergens, "cleaned_allergens")
+
+        with self.store.read() as conn:
+            target_row = conn.execute(
+                "SELECT * FROM batch WHERE batch_no = ?", (batch_no,)
+            ).fetchone()
+            if not target_row:
+                raise not_found(
+                    "CORRECTION_TARGET_NOT_FOUND", f"更正目标不存在，批次号: {batch_no}"
+                )
+            if target_row["status"] == "VOIDED":
+                raise conflict(
+                    "BATCH_VOIDED",
+                    f"批次已作废，不可更正或预演清洁更正: {batch_no}"
+                    "（作废保留可查，批次号不可复用）",
+                )
+
+            line_id = target_row["line_id"]
+            start_seq = target_row["seq"]
+
+            # 同一次当前数据快照：加载同线全部有效批次（作废批次本就不参与残留链）
+            all_batches = _load_batches(conn, line_id, 1)
+            current_chain = _simulate_line(all_batches)
+            preview_chain = _simulate_line(
+                all_batches,
+                override_batch_no=batch_no,
+                override_cleaned=proposed,
+            )
+
+            # 预演中跳过的同线已作废批次（含拟更正点之后的；其清洁视为未发生）
+            skipped_voided = [
+                {
+                    "batch_no": r["batch_no"],
+                    "line_id": r["line_id"],
+                    "seq": r["seq"],
+                    "status": "VOIDED",
+                    "voided_reason": r["voided_reason"],
+                    "voided_at": r["voided_at"],
+                    "reason": "已作废批次不参与同线残留传递，预演逐批推演时自动跳过",
+                }
+                for r in conn.execute(
+                    """SELECT batch_no, line_id, seq, voided_reason, voided_at
+                       FROM batch
+                       WHERE line_id = ? AND status = 'VOIDED' AND seq >= ?
+                       ORDER BY seq""",
+                    (line_id, start_seq),
+                ).fetchall()
+            ]
+
+            entries: list[dict[str, Any]] = []
+            impacted_batch_nos: list[str] = []
+            for b in all_batches:
+                if b["seq"] < start_seq:
+                    continue
+                bn = b["batch_no"]
+                impacted_batch_nos.append(bn)
+                adj_row = conn.execute(
+                    "SELECT * FROM adjudication WHERE batch_no = ?", (bn,)
+                ).fetchone()
+                ship_row = _get_shipment(conn, bn)
+                cur_result = current_chain[bn]
+                prev_result = preview_chain[bn]
+                current_cleaned = b["cleaned"]
+                current_version = adj_row["version"] if adj_row else 0
+                is_target = bn == batch_no
+                changed = (
+                    cur_result["residual"] != prev_result["residual"]
+                    or cur_result["actual"] != prev_result["actual"]
+                    or cur_result["undeclared"] != prev_result["undeclared"]
+                    or cur_result["disposition"] != prev_result["disposition"]
+                )
+                entries.append(
+                    {
+                        "batch_no": bn,
+                        "line_id": line_id,
+                        "seq": b["seq"],
+                        "status": "ACTIVE",
+                        "voided": False,
+                        "is_correction_target": is_target,
+                        "proposed_cleaned_allergens": proposed if is_target else current_cleaned,
+                        "current": {
+                            "version": current_version,
+                            "cleaned_allergens": current_cleaned,
+                            "carried_in_allergens": cur_result["carried_in"],
+                            "residual_allergens": cur_result["residual"],
+                            "from_material_allergens": cur_result["from_materials"],
+                            "actual_allergens": cur_result["actual"],
+                            "undeclared_allergens": cur_result["undeclared"],
+                            "disposition": cur_result["disposition"],
+                            "reasons": cur_result["reasons"],
+                            "sources": cur_result["sources"],
+                        },
+                        "preview": {
+                            "version": current_version + 1,
+                            "trigger_if_applied": "CORRECT_BATCH",
+                            "cleaned_allergens": proposed if is_target else current_cleaned,
+                            "carried_in_allergens": prev_result["carried_in"],
+                            "residual_allergens": prev_result["residual"],
+                            "from_material_allergens": prev_result["from_materials"],
+                            "actual_allergens": prev_result["actual"],
+                            "undeclared_allergens": prev_result["undeclared"],
+                            "disposition": prev_result["disposition"],
+                            "reasons": prev_result["reasons"],
+                            "sources": prev_result["sources"],
+                        },
+                        "changed": changed,
+                        "change_reasons": _preview_change_reasons(
+                            is_target=is_target,
+                            current_cleaned=current_cleaned,
+                            proposed_cleaned=proposed,
+                            cur=cur_result,
+                            prev=prev_result,
+                        ),
+                        # 从拟更正批起的后续有效批次即使结论相同，仍属于版本影响范围
+                        "in_version_scope": True,
+                        "shipment_eligibility": {
+                            # 清洁更正不改变直接用料：待检锁定不参与过敏原推演，
+                            # 出货资格版本不会因正式更正而递增
+                            "version": None if ship_row is None else ship_row["version"],
+                            "would_advance_if_applied": False,
+                            "current": _shipment_payload(ship_row),
+                        },
+                    }
+                )
+
+            affected = _preview_affected_verifications(
+                conn,
+                impacted_batch_nos,
+                {bn: preview_chain[bn] for bn in impacted_batch_nos},
+            )
+
+        return {
+            "simulation": "CLEANING_CORRECTION_PREVIEW",
+            "read_only": True,
+            "correction_target": {
+                "batch_no": batch_no,
+                "line_id": line_id,
+                "seq": start_seq,
+                "current_cleaned_allergens": loads(target_row["cleaned"]),
+                "proposed_cleaned_allergens": proposed,
+            },
+            "line_id": line_id,
+            "start_seq": start_seq,
+            "batches": entries,
+            "skipped_voided_batches": skipped_voided,
+            "affected_verifications": affected,
+        }
+
     def void_batch(self, batch_no: str, reason: str) -> dict[str, Any]:
         """作废误登记、实际未投产的批次。
 
@@ -1659,6 +1934,76 @@ def _affected_verifications(conn, batch_nos: list[str]) -> list[dict[str, Any]]:
         {"verification_no": r["verification_no"], "status": r["status"], "updated_at": r["updated_at"]}
         for r in rows
     ]
+
+
+def _preview_affected_verifications(
+    conn, impacted_batch_nos: list[str], preview_results: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """预演：列出“若正式更正，将因裁决版本追加而转待复核”的已确认核验单。
+
+    仅当前状态为 CONFIRMED 的单据会转态（草稿/待复核本就待重新核验）；
+    每张单据按其单据内顺序列出处于版本影响范围的关联批次及当前/预演版本与结论。
+    预演不改动核验单状态。
+    """
+    if not impacted_batch_nos:
+        return []
+    placeholders = ",".join("?" * len(impacted_batch_nos))
+    rows = conn.execute(
+        f"""SELECT v.verification_no AS verification_no, v.status AS status,
+                   v.updated_at AS updated_at,
+                   vb.position AS position, vb.batch_no AS batch_no,
+                   b.line_id AS line_id, b.seq AS seq,
+                   a.version AS current_version, a.disposition AS current_disposition
+            FROM verification v
+            JOIN verification_batch vb ON vb.verification_no = v.verification_no
+            JOIN batch b ON b.batch_no = vb.batch_no
+            LEFT JOIN adjudication a ON a.batch_no = vb.batch_no
+            WHERE v.status = 'CONFIRMED'
+              AND vb.batch_no IN ({placeholders})
+            ORDER BY v.verification_no, vb.position""",
+        impacted_batch_nos,
+    ).fetchall()
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for r in rows:
+        vn = r["verification_no"]
+        if vn not in grouped:
+            order.append(vn)
+            grouped[vn] = {
+                "verification_no": vn,
+                "current_status": "CONFIRMED",
+                "status_if_applied": "PENDING_REVIEW",
+                "updated_at": r["updated_at"],
+                "reason": (
+                    "所含批次将因清洁更正正式落库而追加裁决版本（CORRECT_BATCH），"
+                    "即使裁决结论不变，已确认核验单也将自动转待复核，重新核验后才能再次确认"
+                ),
+                "batches": [],
+            }
+        preview = preview_results.get(r["batch_no"])
+        grouped[vn]["batches"].append(
+            {
+                "position": r["position"],
+                "batch_no": r["batch_no"],
+                "line_id": r["line_id"],
+                "seq": r["seq"],
+                "current_version": r["current_version"],
+                "current_disposition": r["current_disposition"],
+                "preview_version": None
+                if r["current_version"] is None
+                else r["current_version"] + 1,
+                "preview_disposition": None if preview is None else preview["disposition"],
+                "preview_undeclared_allergens": None
+                if preview is None
+                else preview["undeclared"],
+                "disposition_changed": bool(
+                    preview is not None
+                    and r["current_disposition"] is not None
+                    and preview["disposition"] != r["current_disposition"]
+                ),
+            }
+        )
+    return [grouped[vn] for vn in order]
 
 
 def _change_reasons(conn, batch_no: str, snapshot_version: int) -> list[dict[str, Any]]:
